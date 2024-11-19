@@ -1,0 +1,526 @@
+import os.path
+import time
+from datetime import datetime
+
+import dbf
+import pandas as pd
+import wx
+import wx.adv
+import wx.grid
+from dbfread import DBF
+from collections import Counter
+# 导包
+import configparser
+import shutil
+
+
+from dayend import DayEnd
+
+
+def copy_file(source_path, target_path):
+    entries = os.listdir(source_path)
+    entries.remove("CTI.DBF")
+    entries.remove("CTP.DBF")
+    entries.remove("SPECREC.DBF")
+
+    for p in entries:
+        shutil.copy(source_path + "\\" + p, target_path)
+
+
+def read_dbf(path):
+    dbf_table = DBF(path, encoding="Big5")
+    dbf_df = pd.DataFrame(iter(dbf_table))
+    return dbf_df, dbf_table
+
+
+class DataList(wx.grid.GridTableBase):
+    def __init__(self, datas=[]):
+        super(DataList, self).__init__()
+        self.datas = datas
+
+    def GetNumberCols(self):
+        return len(self.datas[0])
+
+    def GetNumberRows(self):
+        return len(self.datas)
+
+    def GetValue(self, row, col):
+        return self.datas[row][col]
+
+    def GetColLabelValue(self, col):
+        # label = ["Bill Number", "Date", "Amount", "ID"]
+        label = ["Bill Number", "Date", "Amount"]
+        return f'{label[col]}'
+
+    def SetValue(self, row, col, value):
+        pass
+        # self.datas[row][col] = value
+
+    def DeleteRows(self, pos=0, numRows=1):
+        if pos < 0 or pos > len(self.datas):
+            return False
+
+        del self.datas[pos:pos + numRows]
+        msg = wx.grid.GridTableMessage(self,
+                                       wx.grid.GRIDTABLE_NOTIFY_ROWS_DELETED,
+                                       pos, numRows)
+
+        self.GetView().ProcessTableMessage(msg)
+        return True
+
+    def GetAllData(self):
+        all_data = []
+
+        for row in range(self.GetNumberRows()):
+            row_data = []
+            for col in range(self.GetNumberCols()):
+                cell_value = self.GetValue(row, col)
+                row_data.append(cell_value)
+            all_data.append(row_data)
+        return all_data
+
+    def CanGetValueAs(self, row, col, typeName):
+        return False
+
+    def CanSetValueAs(self, row, col, typeName):
+        return False
+
+
+class DetailsGrid(wx.grid.Grid):
+    def __init__(self, parent, number, df_data):
+        wx.grid.Grid.__init__(self, parent)
+
+        filter_data = df_data[(df_data["NUMBER"] == int(number))]
+        self.CreateGrid(len(filter_data), 3)
+        self.SetColLabelValue(0, "Name")
+        self.SetColLabelValue(1, "Qty")
+        self.SetColLabelValue(2, "Price")
+        self.HideRowLabels()
+        # 设置字体大小
+        # font = wx.Font(14, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+        self.SetDefaultCellFont(font)  # set font size
+        self.SetColSize(0, 350)  # Increase COL width
+        # self.SetColSize(0, 100)  # Increase column width
+        # read CTI.DBF file
+
+        row_num = 0
+        for r in filter_data.iloc:
+            self.SetCellValue(row_num, 0, r.DESC1)
+            self.SetCellValue(row_num, 1, str(r.QTY))
+            self.SetCellValue(row_num, 2, str(r.UNITPRICE))
+            self.SetRowSize(row_num, 40)  # Increase row height
+            row_num += 1
+
+
+class PopupDialog(wx.Dialog):
+    def __init__(self, parent, number, df_data):
+        wx.Dialog.__init__(self, parent, title="Sales Item", size=(800, 600))
+
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        grid = DetailsGrid(self, number=number, df_data=df_data)
+        sizer.Add(grid, 1, wx.EXPAND)
+        self.SetSizer(sizer)
+
+
+def create_folder_exists(folder_path, folder_name):
+    directories = [d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d))]
+
+    if folder_name not in directories:
+        os.makedirs(folder_path + folder_name)
+        return folder_path + folder_name
+    else:
+        name = ""
+        for i in range(1, 100):
+            name = folder_name + "." + str(i).zfill(3)
+            if name not in directories:
+                os.makedirs(folder_path + name)
+                break
+        return folder_path + name
+
+
+def processing_data_type(data):
+    lst = []
+    for d in data:
+        if str(d) == "nan":
+            d = 0.0
+        lst.append(d)
+
+    return lst
+
+
+def number_reorder1(df, lst, numbers):
+
+    for l in lst:
+        for i in range(l + 1, numbers[-2] + 1):
+
+            query = df[df["NUMBER"] == i]
+
+            if len(query):
+                # 如果查询有，则往上移编号
+                print(i)
+                df.loc[df["NUMBER"] == i, "NUMBER"] = i - 1
+            else:
+                # 如果没有则下一个往上移，并将移动好的放进第二个
+                # print(lst.remove(l))
+                try:
+                    number_reorder1(df, lst.remove(l), numbers)
+                except:
+                    break
+
+    return df
+
+
+def number_reorder(df, lst):
+
+    for l in lst:
+        df = df[df["NUMBER"] != l]
+        df.loc[df["NUMBER"] > l, "NUMBER"] -= 1
+
+
+    return df
+
+
+def save_ctp(store_path, fields, df):
+    # print(name)
+    # db = dbf.Table(store_path + "\\CTP.DBF", fields, codepage='cp1252', dbf_type='db3')
+    db = dbf.Table(store_path + "\\CTP.DBF", fields, codepage='cp950', dbf_type='db3')
+    db.open(mode=dbf.READ_WRITE)
+    for row in df.iloc:
+        data = (row.ID, row.NUMBER, row.GROUP, row.SHOPCODE, row.ZONE, row.DATE, row.TIME, row.PAYBY, row.AMOUNT,
+                row.RECEIVE, row.POINTS, row.CURRENCY, row.RATE, row.F_RECEIVE, row.TN, row.PAX, row.STAFF,
+                row.ORDERTYPE, row.TDATE, row.TTIME, row.CASHIER, row.CUSTOMER, row.DISCTYPE, row.DCHARGE,
+                row.DISCOUNT, row.SC_RATE, row.SCHARGE, row.CARDNAME, row.CARDNUM, row.TAX, row.TAX1, row.TAX2,
+                row.TAX3, row.ROUNDING, row.ENCASH_ID, row.RIDER, row.REF1, row.REF2, row.TIMER1, row.TIMER2,
+                row.REV, row.PCOUNT, row.POLLED, row.ANALYSIS1, row.SYNC, row.SYNCDATE, row.SPFLAG, row.CALCOST,
+                )
+
+        db.append(tuple(processing_data_type(data)))
+    # table.append(('John Doe', 30, dbf.Date(1990, 5, 29)))
+    db.close()
+
+
+def save_cti(store_path, fields, df):
+
+    db = dbf.Table(store_path + "\\CTI.DBF", fields, codepage='cp950', dbf_type='db3')
+    db.open(mode=dbf.READ_WRITE)
+    for row in df.iloc:
+        data = (
+            row.ID, row.NUMBER, row.GROUP, row.SEQ, row.SUBSEQ, row.XREF, row.FCODE, row.DEPT, row.SUBCODE, row.LEVEL,
+            row.POINTS, row.DESC1, row.DESC2, row.QTY, row.UNITPRICE, row.SEAT, row.TAX1, row.TAX2, row.TAX3, row.DCODE,
+            row.T_ABLE, row.D_ABLE, row.SC_ABLE, row.TOMAIN, row.TAX_GROUP, row.TN, row.CASHIER, row.DATE, row.TIME,
+            row.FGROUP, row.ORDERTYPE, row.POSTED, row.REMARK, row.K1, row.SYNC, row.HANDLE_ID, row.CALCOST,
+        )
+
+        db.append(tuple(processing_data_type(data)))
+    # table.append(('John Doe', 30, dbf.Date(1990, 5, 29)))
+    db.close()
+
+
+def save_specrec(store_path, fields, df):
+    db = dbf.Table(store_path + "\\SPECREC.DBF", fields, codepage='cp950', dbf_type='db3')
+    db.open(mode=dbf.READ_WRITE)
+    for row in df.iloc:
+        data = (
+            row.CASHIER, row.MANAGER, row.TDATE, row.TTIME, row.DATE, row.TIME, row.TABLE, row.FCODE, row.QTY,
+            row.REMARK, row.UNITPRICE, row.DESC1, row.NUMBER, row.ID, row.GROUP, row.REASON, row.HANDLE_ID, row.SYNC,
+
+        )
+
+        db.append(tuple(processing_data_type(data)))
+    # table.append(('John Doe', 30, dbf.Date(1990, 5, 29)))
+    db.close()
+
+
+def get_fields(lst):
+    fields = ""
+    # name = ""
+    for l in lst:
+        # print(l)
+        # name += "row." + l.name + ","
+        if l.type == "N":
+            fields += f"{l.name} {l.type}({l.length + 10},{l.decimal_count});"
+        elif l.type == "L":
+            fields += f"{l.name} {l.type};"
+        else:
+            fields += f"{l.name} {l.type}({l.length + 10});"
+    # print(name)
+    return fields
+
+
+def generate_dayend():
+    pass
+
+
+def show_message_dialog(parent, message):
+    dialog = wx.MessageDialog(parent, message, 'Warning')
+    result = dialog.ShowModal()
+    dialog.Destroy()
+    return result
+
+
+class CalendarDemo:
+    def __init__(self, parent):
+
+
+        self.parent = parent
+        self.calendar = wx.adv.CalendarCtrl(parent, -1)
+        # self.calendar.Bind(wx.adv.EVT_CALENDAR_DAY, self.onDayClick)
+
+        self.delete_button = wx.Button(self.parent, wx.ID_DELETE, 'Delete Row', pos=(200, 650))
+        self.delete_button.Bind(wx.EVT_BUTTON, self.OnDeleteRow)
+
+
+        self.print_button = wx.Button(panel, label="Print", pos=(30, 650))
+        self.print_button.Bind(wx.EVT_BUTTON, self.printClick)
+
+
+        self.tables = wx.grid.Grid(self.parent, pos=(30, 200), size=(800, 400))  # size 第一个参数是宽，第二个是高
+        self.tables.SetDefaultCellFont(font)  # set font size
+
+
+        self.showDataButton = wx.Button(panel, label="讀取銷售記錄", pos=(300, 30), size=(150, 50))
+        self.showDataButton.Bind(wx.EVT_BUTTON, self.onDayClick)
+
+        self.todayDataButton = wx.Button(panel, label="Today", pos=(50, 170))
+        self.todayDataButton.Bind(wx.EVT_BUTTON, self.resetDate)
+
+        self.cash_sales1 = wx.StaticText(parent, label="Total Cash", pos=(250, 140))
+        self.cash_sales_amount1 = wx.TextCtrl(parent, value="0", pos=(250, 160), size=(60, 20))
+        self.cash_sales2 = wx.StaticText(parent, label="Selected Cash", pos=(350, 140))
+        self.cash_sales_amount2 = wx.TextCtrl(parent, value="0", pos=(350, 160), size=(60, 20))
+
+
+        self.parent.Bind(wx.grid.EVT_GRID_RANGE_SELECT, self.OnCellSelected, self.tables)
+        self.select_list = []
+        self.select_all = wx.Button(panel, label="選中全部", pos=(850, 250))
+        self.select_all.SetBackgroundColour("green")
+        self.select_all.Bind(wx.EVT_BUTTON, self.selectAllClick)
+        self.clear_all = wx.Button(panel, label="清除全部", pos=(850, 280))
+        self.clear_all.Bind(wx.EVT_BUTTON, self.clearAllClick)
+
+        # Binding double click event
+        self.parent.Bind(wx.grid.EVT_GRID_CELL_LEFT_DCLICK, self.onCellLeftDClick)
+        #
+        self.__amount_col = 2
+        self.__bill_col = 0
+        self.__date_col = 1
+        # self.__bill_col = 0
+
+    def resetDate(self, event):
+        self.calendar.SetDate(wx.DateTime.Now())
+
+    def read_specrec(self):
+        specrecPath = sourcePath + self.str_date + "\\SPECREC.DBF"
+
+        self.specrec_df, self.dbf_specrec = read_dbf(specrecPath)
+        self.specrec_df = pd.DataFrame(iter(self.dbf_specrec))
+        if len(self.specrec_df) == 0:
+            self.specrec_df = pd.DataFrame([], columns=['CASHIER', 'MANAGER', 'TDATE', 'TTIME', 'DATE', 'TIME', 'TABLE',
+                                                        'FCODE', 'QTY', 'REMARK', 'UNITPRICE', 'DESC1', 'NUMBER', 'ID',
+                                                        'GROUP',
+                                                        'REASON', 'HANDLE_ID', 'SYNC'])
+        self.specrec_df["UNITPRICE"] = self.specrec_df["UNITPRICE"].fillna(0).astype(float)
+        self.specrec_df["subtotal"] = self.specrec_df["UNITPRICE"] * self.specrec_df["QTY"]
+
+    def detailedData(self):
+        path = sourcePath + self.str_date + "\\CTI.DBF"
+        # path = "F:\\eod\\" + self.str_date + "\\CTI.DBF"
+        self.detail_data, self.dbf_cti = read_dbf(path)
+        self.cti_detail_df = self.detail_data.copy()
+
+    def onCellLeftDClick(self, event):
+        row = event.GetRow()
+        col = event.GetCol()
+        bill_number = self.tables.GetCellValue(row, self.__bill_col)
+        # print("Double left click on cell: (%d, %d)" % (row, col))
+        event.Skip()
+        dlg = PopupDialog(parent=self.parent, number=bill_number, df_data=self.detail_data)
+        dlg.ShowModal()
+        dlg.Destroy()
+
+    def selectAllClick(self, event):
+        rows = self.tables.GetNumberRows()
+        self.select_list = []
+        now_amount = 0
+        for row in range(0, rows):
+            amount = self.infoTable.GetValue(row, self.__amount_col)
+            now_amount += float(amount)
+            self._OnCellSelected(row=row, colour="green")
+            self.select_list.append(row)
+        self.cash_sales_amount2.SetValue(str(round(now_amount, 2)))
+        self.tables.ForceRefresh()
+
+    def clearAllClick(self, event):
+        rows = self.tables.GetNumberRows()
+        for row in range(0, rows):
+            self._OnCellSelected(row=row, colour="white")
+        self.select_list = []
+        self.tables.ForceRefresh()
+        self.cash_sales_amount2.SetValue(str(0))
+
+    def _OnCellSelected(self, row, colour="white"):
+        attr = wx.grid.GridCellAttr()
+        attr.SetBackgroundColour(colour)
+        # self.tables.SetRowAttr(row, attr)
+        self.infoTable.SetRowAttr(attr, row)
+
+    def OnCellSelected(self, event):
+        if event.Selecting():
+            BottomRowNum = event.GetBottomRow()
+            TopRowNum = event.GetTopRow()
+
+            for BottomRow in range(TopRowNum, BottomRowNum + 1):
+                time.sleep(0.1)
+                amount = self.infoTable.GetValue(BottomRow, self.__amount_col)
+                if BottomRow in self.select_list:
+                    self._OnCellSelected(row=BottomRow, colour="white")
+                    self.select_list.remove(BottomRow)
+                    add_amount = round(float(self.cash_sales_amount2.GetValue()) - float(amount), 2)
+                else:
+                    # 如果不在，则选中状态
+                    self._OnCellSelected(row=BottomRow, colour="green")
+                    self.select_list.append(BottomRow)
+                    add_amount = round(float(self.cash_sales_amount2.GetValue()) + float(amount), 2)
+                self.cash_sales_amount2.SetValue(str(add_amount))
+                self.tables.ForceRefresh()
+
+    def onDayClick(self, event):
+        self.select_list = []  # 初始化select list
+        # store delete bill number
+        self.__delete_bill_number = []
+
+        date = self.calendar.GetDate()
+        year = date.GetYear()
+        month = date.GetMonth() + 1
+        day = date.GetDay()
+        self.str_date = str(year) + str(month).zfill(2) + str(day).zfill(2)
+
+        path = sourcePath + self.str_date + "\\CTP.DBF"
+        # path = "F:\\eod\\" + self.str_date + "\\CTP.DBF"
+        try:
+            self.dbf_table = DBF(path, encoding="Big5")
+        except Exception as e:
+            show_message_dialog(panel, "Data not exist")  # 弹窗提示
+            return
+        dbf_df = pd.DataFrame(iter(self.dbf_table))
+        self.df = dbf_df.reset_index()
+        # Rename the new index to 'SerialNumber'
+        # self.df = df.rename(columns={'index': 'SerialNumber'})
+
+
+        df_number_list = self.df["NUMBER"].tolist()
+        counts = Counter(df_number_list)
+        duplicates = [item for item, count in counts.items() if count > 1]
+        payby1_record = self.df[
+            (self.df['PAYBY'] == 1) & (self.df['GROUP'] == "@") & (self.df['DATE'] != "") & ~(
+                self.df["NUMBER"].isin(duplicates))]
+        # payby1_record = self.df[(self.df['PAYBY'] == 1) & (self.df['GROUP'] == "@")]
+        num_index = 0
+        d = []
+
+        first_sales_amount = 0
+        for r in payby1_record.iloc:
+            # d.append([r.NUMBER, r.DATE, r.AMOUNT, r.SerialNumber])
+            d.append([r.NUMBER, r.DATE, r.AMOUNT])
+            num_index += 1
+            first_sales_amount += r.AMOUNT
+        total_cash_amount = self.df[self.df['PAYBY'] == 1]["AMOUNT"].sum()
+        self.cash_sales_amount1.SetValue(str(round(total_cash_amount, 2)))
+        self.cash_sales_amount2.SetValue("0")
+        self.infoTable = DataList(d)
+
+        self.tables.SetTable(self.infoTable, True)
+        self.tables.SetColSize(self.__bill_col, 100)
+        self.tables.SetColSize(self.__amount_col, 150)
+        self.tables.SetColSize(self.__date_col, 150)
+        for i in range(0, len(d)):
+            self.tables.SetRowSize(i, 40)
+        self.tables.ForceRefresh()
+        self.detailedData()
+
+    def common_message_pop_up_notification(self, msg, title):
+        box = wx.MessageDialog(None, msg, title, wx.OK)
+        box.ShowModal()
+        box.Destroy()
+
+    def printClick(self, event):
+        """
+        :param event:
+        :return:
+        """
+        try:
+            store_path = create_folder_exists(targetPath, self.str_date)
+        except Exception as e:
+            print(e)
+            self.common_message_pop_up_notification("The target path directory does not exist, please check",
+                                                    'Error Prompt')
+            return
+
+        # df = self.df[~self.df["NUMBER"].isin(self.__delete_bill_number)]
+        # 处理排序问题
+        # df_number = self.df["NUMBER"]
+        # numbers = sorted(list(set(df_number.tolist())))
+        df_write = number_reorder(self.df, sorted(self.__delete_bill_number, reverse=True))
+
+        lst = self.dbf_table.fields
+        cti_lst = self.dbf_cti.fields
+        cti_delete_time_list = self.cti_detail_df[self.cti_detail_df["NUMBER"].isin(self.__delete_bill_number)][
+            "TIME"].tolist()
+        df_cti_write = number_reorder(self.detail_data, sorted(self.__delete_bill_number, reverse=True))
+        # SPECRCE
+        self.read_specrec()
+        df_specrce_write = self.specrec_df[~self.specrec_df["TTIME"].isin(cti_delete_time_list)]
+        df_specrce_write["NUMBER"] = 0
+        specrce_lst = self.dbf_specrec.fields
+
+        save_ctp(store_path, get_fields(lst), df_write)
+        save_cti(store_path, get_fields(cti_lst), df_cti_write)
+        save_specrec(store_path, get_fields(specrce_lst), df_specrce_write)
+        copy_file(source_path=sourcePath + self.str_date, target_path=store_path)
+
+
+        dayend = DayEnd(path=store_path, dis_info=dis_info)
+        dayend.run()
+        dayend.write_dayend()
+
+    def OnDeleteRow(self, event):
+        # selected_rows = self.tables.GetSelectedRows()
+        selected_rows = self.select_list
+        delete_amount_total = 0
+
+        for row in sorted(selected_rows, reverse=True):  # iterate in reverse order
+            amount = self.infoTable.GetValue(row, self.__amount_col)
+            bill_number = self.infoTable.GetValue(row, self.__bill_col)
+            self.__delete_bill_number.append(int(bill_number))
+            delete_amount_total += float(amount)
+            self.infoTable.DeleteRows(row)
+            self.tables.ClearSelection()
+            self.tables.ForceRefresh()
+            filter_data = self.detail_data[self.detail_data["NUMBER"] == int(bill_number)]
+            self.detail_data.drop(filter_data.index, axis=0, inplace=True)
+        now_amount_total = round(float(self.cash_sales_amount1.GetValue()) - delete_amount_total, 2)
+        self.select_list = []  # 删除后初始化list
+        self.cash_sales_amount1.SetValue(str(now_amount_total))
+        self.cash_sales_amount2.SetValue(str(0))
+
+
+if __name__ == "__main__":
+
+    today = datetime.now().strftime("%Y%m%d")
+
+    config = configparser.ConfigParser()
+
+    config_path = r'./broswer_config.ini'
+    config.read(config_path)
+    sourcePath = config['General']['sourcePath']
+    targetPath = config['General']['targetPath']
+    dis_info = config['General']['disInfo']
+
+    app = wx.App()
+
+    window = wx.Frame(None, title="POS", size=(1200, 800))
+    panel = wx.Panel(window)
+    font = wx.Font(14, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
+    CalendarDemo(panel)
+    window.Show(True)
+    app.MainLoop()
